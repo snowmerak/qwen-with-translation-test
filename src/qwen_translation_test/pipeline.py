@@ -9,17 +9,28 @@ from .config import Settings
 from .database import ChatDatabase
 
 
-TRANSLATION_PROMPT = """Translate the following text into {target_lang}. Note that you should only output the translated result without any additional explanation:
+ENGLISH_TRANSLATION_PROMPT = """Translate the following text into {target_lang}. Note that you should only output the translated result without any additional explanation:
 
 {source_text}"""
+
+CHINESE_TRANSLATION_PROMPT = """将以下文本翻译为{target_lang}，注意只需要输出翻译后的结果，不要额外解释：
+
+{source_text}"""
+
+CHINESE_LANGUAGE_NAMES = {
+    "Chinese": "中文",
+    "English": "英语",
+    "Korean": "韩语",
+}
 
 
 @dataclass(frozen=True, slots=True)
 class TurnResult:
     user_ko: str
-    user_en: str
-    assistant_en: str
+    user_pivot: str
+    assistant_pivot: str
     assistant_ko: str
+    pivot_language: str
 
 
 class TranslationChatPipeline:
@@ -38,11 +49,23 @@ class TranslationChatPipeline:
             max_retries=1,
         )
 
-    def translate(self, source_text: str, target_lang: str) -> str:
-        prompt = TRANSLATION_PROMPT.format(
-            target_lang=target_lang,
-            source_text=source_text,
-        )
+    def translate(
+        self,
+        source_text: str,
+        target_lang: str,
+        *,
+        prompt_language: str = "English",
+    ) -> str:
+        if prompt_language == "Chinese":
+            prompt = CHINESE_TRANSLATION_PROMPT.format(
+                target_lang=CHINESE_LANGUAGE_NAMES[target_lang],
+                source_text=source_text,
+            )
+        else:
+            prompt = ENGLISH_TRANSLATION_PROMPT.format(
+                target_lang=target_lang,
+                source_text=source_text,
+            )
         response = self.client.chat.completions.create(
             model=self.settings.hy_model,
             messages=[{"role": "user", "content": prompt}],
@@ -52,13 +75,19 @@ class TranslationChatPipeline:
         )
         return _completion_text(response)
 
-    def answer_in_english(
-        self, conversation_id: int, user_en: str
+    def answer_in_pivot_language(
+        self,
+        conversation_id: int,
+        user_pivot: str,
+        pivot_language: str,
     ) -> str:
+        system_prompt = self.settings.qwen_system_prompt.replace(
+            "{pivot_language}", pivot_language
+        )
         messages = [
-            {"role": "system", "content": self.settings.qwen_system_prompt},
-            *self.database.get_english_context(conversation_id),
-            {"role": "user", "content": user_en},
+            {"role": "system", "content": system_prompt},
+            *self.database.get_pivot_context(conversation_id),
+            {"role": "user", "content": user_pivot},
         ]
         response = self.client.chat.completions.create(
             model=self.settings.qwen_model,
@@ -75,22 +104,34 @@ class TranslationChatPipeline:
         if not self.database.conversation_exists(conversation_id):
             raise ValueError(f"Conversation {conversation_id} does not exist")
 
-        user_en = self.translate(user_ko, "English")
-        assistant_en = self.answer_in_english(conversation_id, user_en)
-        assistant_ko = self.translate(assistant_en, "Korean")
+        pivot_language = self.database.get_pivot_language(conversation_id)
+        user_pivot = self.translate(
+            user_ko,
+            pivot_language,
+            prompt_language=pivot_language,
+        )
+        assistant_pivot = self.answer_in_pivot_language(
+            conversation_id, user_pivot, pivot_language
+        )
+        assistant_ko = self.translate(
+            assistant_pivot,
+            "Korean",
+            prompt_language=pivot_language,
+        )
 
         self.database.append_turn(
             conversation_id,
             user_ko=user_ko,
-            user_en=user_en,
-            assistant_en=assistant_en,
+            user_pivot=user_pivot,
+            assistant_pivot=assistant_pivot,
             assistant_ko=assistant_ko,
         )
         return TurnResult(
             user_ko=user_ko,
-            user_en=user_en,
-            assistant_en=assistant_en,
+            user_pivot=user_pivot,
+            assistant_pivot=assistant_pivot,
             assistant_ko=assistant_ko,
+            pivot_language=pivot_language,
         )
 
     def list_model_ids(self) -> list[str]:

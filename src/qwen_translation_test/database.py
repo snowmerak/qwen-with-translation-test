@@ -11,7 +11,7 @@ Role = Literal["user", "assistant"]
 @dataclass(frozen=True, slots=True)
 class StoredMessage:
     role: Role
-    content_en: str
+    content_pivot: str
     content_ko: str
 
 
@@ -31,6 +31,7 @@ class ChatDatabase:
             CREATE TABLE IF NOT EXISTS conversations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL DEFAULT 'New conversation',
+                pivot_language TEXT NOT NULL DEFAULT 'English',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -40,7 +41,7 @@ class ChatDatabase:
                 conversation_id INTEGER NOT NULL,
                 sequence INTEGER NOT NULL,
                 role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
-                content_en TEXT NOT NULL,
+                content_pivot TEXT NOT NULL,
                 content_ko TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (conversation_id)
@@ -52,11 +53,41 @@ class ChatDatabase:
                 ON messages(conversation_id, sequence);
             """
         )
+        self._migrate_english_schema()
         self.connection.commit()
 
-    def create_conversation(self, title: str = "New conversation") -> int:
+    def _migrate_english_schema(self) -> None:
+        conversation_columns = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA table_info(conversations)"
+            ).fetchall()
+        }
+        if "pivot_language" not in conversation_columns:
+            self.connection.execute(
+                "ALTER TABLE conversations ADD COLUMN "
+                "pivot_language TEXT NOT NULL DEFAULT 'English'"
+            )
+
+        message_columns = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA table_info(messages)"
+            ).fetchall()
+        }
+        if "content_pivot" not in message_columns and "content_en" in message_columns:
+            self.connection.execute(
+                "ALTER TABLE messages RENAME COLUMN content_en TO content_pivot"
+            )
+
+    def create_conversation(
+        self,
+        pivot_language: str = "English",
+        title: str = "New conversation",
+    ) -> int:
         cursor = self.connection.execute(
-            "INSERT INTO conversations(title) VALUES (?)", (title,)
+            "INSERT INTO conversations(title, pivot_language) VALUES (?, ?)",
+            (title, pivot_language),
         )
         self.connection.commit()
         return int(cursor.lastrowid)
@@ -67,13 +98,22 @@ class ChatDatabase:
         ).fetchone()
         return row is not None
 
+    def get_pivot_language(self, conversation_id: int) -> str:
+        row = self.connection.execute(
+            "SELECT pivot_language FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Conversation {conversation_id} does not exist")
+        return str(row["pivot_language"])
+
     def append_turn(
         self,
         conversation_id: int,
         *,
         user_ko: str,
-        user_en: str,
-        assistant_en: str,
+        user_pivot: str,
+        assistant_pivot: str,
         assistant_ko: str,
     ) -> None:
         row = self.connection.execute(
@@ -88,16 +128,16 @@ class ChatDatabase:
             self.connection.executemany(
                 """
                 INSERT INTO messages(
-                    conversation_id, sequence, role, content_en, content_ko
+                    conversation_id, sequence, role, content_pivot, content_ko
                 ) VALUES (?, ?, ?, ?, ?)
                 """,
                 [
-                    (conversation_id, sequence, "user", user_en, user_ko),
+                    (conversation_id, sequence, "user", user_pivot, user_ko),
                     (
                         conversation_id,
                         sequence + 1,
                         "assistant",
-                        assistant_en,
+                        assistant_pivot,
                         assistant_ko,
                     ),
                 ],
@@ -118,7 +158,7 @@ class ChatDatabase:
     def get_messages(self, conversation_id: int) -> list[StoredMessage]:
         rows = self.connection.execute(
             """
-            SELECT role, content_en, content_ko
+            SELECT role, content_pivot, content_ko
             FROM messages
             WHERE conversation_id = ?
             ORDER BY sequence
@@ -128,22 +168,22 @@ class ChatDatabase:
         return [
             StoredMessage(
                 role=row["role"],
-                content_en=row["content_en"],
+                content_pivot=row["content_pivot"],
                 content_ko=row["content_ko"],
             )
             for row in rows
         ]
 
-    def get_english_context(self, conversation_id: int) -> list[dict[str, str]]:
+    def get_pivot_context(self, conversation_id: int) -> list[dict[str, str]]:
         return [
-            {"role": message.role, "content": message.content_en}
+            {"role": message.role, "content": message.content_pivot}
             for message in self.get_messages(conversation_id)
         ]
 
     def list_conversations(self) -> list[sqlite3.Row]:
         return self.connection.execute(
             """
-            SELECT c.id, c.title, c.created_at, c.updated_at,
+            SELECT c.id, c.title, c.pivot_language, c.created_at, c.updated_at,
                    COUNT(m.id) AS message_count
             FROM conversations AS c
             LEFT JOIN messages AS m ON m.conversation_id = c.id

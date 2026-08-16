@@ -18,6 +18,7 @@ class Settings:
     qwen_max_tokens: int
     qwen_temperature: float
     qwen_system_prompt: str
+    pivot_language: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -35,7 +36,11 @@ class Settings:
             qwen_temperature=_float_env("QWEN_TEMPERATURE", 0.7),
             qwen_system_prompt=os.getenv(
                 "QWEN_SYSTEM_PROMPT",
-                "Answer the user's request clearly and accurately.",
+                "Answer the user's request clearly and accurately in "
+                "{pivot_language}.",
+            ),
+            pivot_language=normalize_pivot_language(
+                os.getenv("PIVOT_LANGUAGE", "English")
             ),
         )
 
@@ -58,3 +63,22 @@ def _float_env(name: str, default: float) -> float:
         return float(value)
     except ValueError as error:
         raise ValueError(f"{name} must be a number, got {value!r}") from error
+
+
+def normalize_pivot_language(value: str) -> str:
+    aliases = {
+        "en": "English",
+        "english": "English",
+        "영어": "English",
+        "zh": "Chinese",
+        "zh-cn": "Chinese",
+        "chinese": "Chinese",
+        "중국어": "Chinese",
+    }
+    normalized = aliases.get(value.strip().lower())
+    if normalized is None:
+        raise ValueError(
+            "PIVOT_LANGUAGE must be English or Chinese, "
+            f"got {value!r}"
+        )
+    return normalized

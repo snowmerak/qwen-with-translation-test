@@ -1,26 +1,61 @@
+import sqlite3
 from pathlib import Path
 
 from qwen_translation_test.database import ChatDatabase
 
 
-def test_stores_bilingual_pairs_and_builds_english_context(tmp_path: Path) -> None:
+def test_stores_bilingual_pairs_and_builds_pivot_context(tmp_path: Path) -> None:
     with ChatDatabase(tmp_path / "test.db") as database:
-        conversation_id = database.create_conversation()
+        conversation_id = database.create_conversation("Chinese")
         database.append_turn(
             conversation_id,
             user_ko="안녕",
-            user_en="Hello",
-            assistant_en="Hello! How can I help?",
+            user_pivot="你好",
+            assistant_pivot="你好！有什么可以帮助你的？",
             assistant_ko="안녕하세요! 무엇을 도와드릴까요?",
         )
 
-        assert database.get_english_context(conversation_id) == [
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hello! How can I help?"},
+        assert database.get_pivot_language(conversation_id) == "Chinese"
+        assert database.get_pivot_context(conversation_id) == [
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "你好！有什么可以帮助你的？"},
         ]
 
         stored = database.get_messages(conversation_id)
         assert stored[0].content_ko == "안녕"
-        assert stored[0].content_en == "Hello"
+        assert stored[0].content_pivot == "你好"
         assert stored[1].content_ko == "안녕하세요! 무엇을 도와드릴까요?"
-        assert stored[1].content_en == "Hello! How can I help?"
+        assert stored[1].content_pivot == "你好！有什么可以帮助你的？"
+
+
+def test_migrates_existing_english_database(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE conversations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL DEFAULT 'New conversation',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_id INTEGER NOT NULL,
+            sequence INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content_en TEXT NOT NULL,
+            content_ko TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT INTO conversations(title) VALUES ('Legacy');
+        INSERT INTO messages(
+            conversation_id, sequence, role, content_en, content_ko
+        ) VALUES (1, 1, 'user', 'Hello', '안녕');
+        """
+    )
+    connection.close()
+
+    with ChatDatabase(path) as database:
+        assert database.get_pivot_language(1) == "English"
+        assert database.get_messages(1)[0].content_pivot == "Hello"

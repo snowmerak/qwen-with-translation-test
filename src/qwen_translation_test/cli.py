@@ -5,14 +5,14 @@ import sys
 
 from openai import OpenAIError
 
-from .config import Settings
+from .config import Settings, normalize_pivot_language
 from .database import ChatDatabase
 from .pipeline import TranslationChatPipeline, TurnResult
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Chat with Qwen through Korean-English-Korean translation."
+        description="Chat with Qwen through an English or Chinese pivot translation."
     )
     parser.add_argument(
         "--conversation",
@@ -25,9 +25,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run one turn and exit. Only the final Korean response is printed.",
     )
     parser.add_argument(
+        "--pivot-language",
+        type=normalize_pivot_language,
+        choices=["English", "Chinese"],
+        help="Pivot language for a new conversation (English or Chinese).",
+    )
+    parser.add_argument(
+        "--show-pivot",
         "--show-english",
+        dest="show_pivot",
         action="store_true",
-        help="Show the Korean-to-English input and Qwen's English response.",
+        help="Show the translated input and Qwen's response before Korean translation.",
     )
     parser.add_argument(
         "--list-models",
@@ -58,21 +66,29 @@ def main(argv: list[str] | None = None) -> None:
                 _print_conversations(database)
                 return
 
-            conversation_id = _conversation_id(database, args.conversation)
+            conversation_id = _conversation_id(
+                database,
+                args.conversation,
+                args.pivot_language or settings.pivot_language,
+            )
             if args.once is not None:
                 result = pipeline.run_turn(conversation_id, args.once)
-                _print_result(result, args.show_english, one_shot=True)
+                _print_result(result, args.show_pivot, one_shot=True)
                 return
 
-            _interactive_chat(pipeline, database, conversation_id, args.show_english)
+            _interactive_chat(pipeline, database, conversation_id, args.show_pivot)
     except (OpenAIError, OSError, RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         raise SystemExit(1) from error
 
 
-def _conversation_id(database: ChatDatabase, requested: int | None) -> int:
+def _conversation_id(
+    database: ChatDatabase,
+    requested: int | None,
+    pivot_language: str,
+) -> int:
     if requested is None:
-        return database.create_conversation()
+        return database.create_conversation(pivot_language)
     if not database.conversation_exists(requested):
         raise ValueError(f"Conversation {requested} does not exist")
     return requested
@@ -82,9 +98,10 @@ def _interactive_chat(
     pipeline: TranslationChatPipeline,
     database: ChatDatabase,
     conversation_id: int,
-    show_english: bool,
+    show_pivot: bool,
 ) -> None:
-    print(f"conversation: {conversation_id}")
+    pivot_language = database.get_pivot_language(conversation_id)
+    print(f"conversation: {conversation_id} ({pivot_language} pivot)")
     print("종료: /quit, 저장 내역: /history")
     while True:
         try:
@@ -102,15 +119,16 @@ def _interactive_chat(
             continue
 
         result = pipeline.run_turn(conversation_id, user_ko)
-        _print_result(result, show_english, one_shot=False)
+        _print_result(result, show_pivot, one_shot=False)
 
 
 def _print_result(
-    result: TurnResult, show_english: bool, *, one_shot: bool
+    result: TurnResult, show_pivot: bool, *, one_shot: bool
 ) -> None:
-    if show_english:
-        print(f"[입력 영문]\n{result.user_en}", file=sys.stderr)
-        print(f"[Qwen 영문]\n{result.assistant_en}", file=sys.stderr)
+    if show_pivot:
+        label = "EN" if result.pivot_language == "English" else "ZH"
+        print(f"[입력 {label}]\n{result.user_pivot}", file=sys.stderr)
+        print(f"[Qwen {label}]\n{result.assistant_pivot}", file=sys.stderr)
     if one_shot:
         print(result.assistant_ko)
     else:
@@ -122,10 +140,12 @@ def _print_history(database: ChatDatabase, conversation_id: int) -> None:
     if not messages:
         print("저장된 메시지가 없습니다.")
         return
+    pivot_language = database.get_pivot_language(conversation_id)
+    label = "EN" if pivot_language == "English" else "ZH"
     for message in messages:
         speaker = "나" if message.role == "user" else "Qwen"
         print(f"\n{speaker} [KO]> {message.content_ko}")
-        print(f"{speaker} [EN]> {message.content_en}")
+        print(f"{speaker} [{label}]> {message.content_pivot}")
 
 
 def _print_conversations(database: ChatDatabase) -> None:
@@ -136,7 +156,7 @@ def _print_conversations(database: ChatDatabase) -> None:
     for row in rows:
         print(
             f"{row['id']:>4}  {row['message_count']:>4} messages  "
-            f"{row['updated_at']}  {row['title']}"
+            f"{row['pivot_language']:<7}  {row['updated_at']}  {row['title']}"
         )
 
 

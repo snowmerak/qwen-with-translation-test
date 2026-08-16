@@ -7,10 +7,11 @@ from qwen_translation_test.pipeline import TranslationChatPipeline
 
 
 class FakeCompletions:
-    def __init__(self) -> None:
+    def __init__(self, outputs: list[str] | None = None) -> None:
         self.calls: list[dict[str, object]] = []
         self.outputs = iter(
-            [
+            outputs
+            or [
                 "What is Python?",
                 "Python is a general-purpose programming language.",
                 "Python은 범용 프로그래밍 언어입니다.",
@@ -36,7 +37,8 @@ def settings(database_path: Path) -> Settings:
         hy_max_tokens=4096,
         qwen_max_tokens=4096,
         qwen_temperature=0.7,
-        qwen_system_prompt="Answer clearly.",
+        qwen_system_prompt="Answer clearly in {pivot_language}.",
+        pivot_language="English",
     )
 
 
@@ -62,28 +64,34 @@ def test_pipeline_calls_hy_qwen_hy_and_persists_pair(tmp_path: Path) -> None:
         ]
         qwen_messages = fake_completions.calls[1]["messages"]
         assert qwen_messages == [
-            {"role": "system", "content": "Answer clearly."},
+            {"role": "system", "content": "Answer clearly in English."},
             {"role": "user", "content": "What is Python?"},
         ]
-        assert database.get_english_context(conversation_id)[-1] == {
+        assert database.get_pivot_context(conversation_id)[-1] == {
             "role": "assistant",
             "content": "Python is a general-purpose programming language.",
         }
 
 
-def test_next_turn_uses_only_english_history(tmp_path: Path) -> None:
-    fake_completions = FakeCompletions()
+def test_chinese_pipeline_uses_only_chinese_history(tmp_path: Path) -> None:
+    fake_completions = FakeCompletions(
+        [
+            "Python是什么？",
+            "Python是一种通用编程语言。",
+            "Python은 범용 프로그래밍 언어입니다.",
+        ]
+    )
     fake_client = SimpleNamespace(
         chat=SimpleNamespace(completions=fake_completions)
     )
 
     with ChatDatabase(tmp_path / "test.db") as database:
-        conversation_id = database.create_conversation()
+        conversation_id = database.create_conversation("Chinese")
         database.append_turn(
             conversation_id,
             user_ko="이전 질문",
-            user_en="Previous question",
-            assistant_en="Previous answer",
+            user_pivot="上一个问题",
+            assistant_pivot="上一个回答",
             assistant_ko="이전 답변",
         )
         pipeline = TranslationChatPipeline(
@@ -93,6 +101,16 @@ def test_next_turn_uses_only_english_history(tmp_path: Path) -> None:
         pipeline.run_turn(conversation_id, "Python이 뭐야?")
 
         qwen_messages = fake_completions.calls[1]["messages"]
-        assert {"role": "user", "content": "Previous question"} in qwen_messages
-        assert {"role": "assistant", "content": "Previous answer"} in qwen_messages
+        assert qwen_messages[0] == {
+            "role": "system",
+            "content": "Answer clearly in Chinese.",
+        }
+        assert {"role": "user", "content": "上一个问题"} in qwen_messages
+        assert {"role": "assistant", "content": "上一个回答"} in qwen_messages
         assert all("이전" not in message["content"] for message in qwen_messages)
+        assert database.get_pivot_language(conversation_id) == "Chinese"
+
+        first_hy_prompt = fake_completions.calls[0]["messages"][0]["content"]
+        final_hy_prompt = fake_completions.calls[2]["messages"][0]["content"]
+        assert first_hy_prompt.startswith("将以下文本翻译为中文")
+        assert final_hy_prompt.startswith("将以下文本翻译为韩语")
