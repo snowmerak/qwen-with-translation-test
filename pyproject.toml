@@ -6,11 +6,13 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "openai>=1.66.0",
+    "pydantic-monty>=0.0.21",
     "python-dotenv>=1.0.1",
 ]
 
 [project.scripts]
 qwen-translate-chat = "qwen_translation_test.cli:main"
+qwen-translate-benchmark = "qwen_translation_test.benchmark:main"
 
 [dependency-groups]
 dev = [

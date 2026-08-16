@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any
 
 from openai import OpenAI
 
 from .config import Settings
 from .database import ChatDatabase
+from .sandbox import MontyPythonSandbox, SandboxSettings
 
 
 ENGLISH_TRANSLATION_PROMPT = """Translate the following text into {target_lang}. Note that you should only output the translated result without any additional explanation:
@@ -23,6 +26,29 @@ CHINESE_LANGUAGE_NAMES = {
     "Korean": "韩语",
 }
 
+PYTHON_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "execute_python",
+        "description": (
+            "Execute Python 3.11 code in an isolated, network-disabled container. "
+            "Use it for calculations, data processing, or verifying code. "
+            "Print the values needed to answer the user."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Complete Python source code to execute.",
+                }
+            },
+            "required": ["code"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 
 @dataclass(frozen=True, slots=True)
 class TurnResult:
@@ -31,6 +57,9 @@ class TurnResult:
     assistant_pivot: str
     assistant_ko: str
     pivot_language: str
+    input_translation_seconds: float
+    qwen_seconds: float
+    output_translation_seconds: float
 
 
 class TranslationChatPipeline:
@@ -39,6 +68,8 @@ class TranslationChatPipeline:
         settings: Settings,
         database: ChatDatabase,
         client: OpenAI | Any | None = None,
+        sandbox_settings: SandboxSettings | None = None,
+        python_sandbox: MontyPythonSandbox | Any | None = None,
     ) -> None:
         self.settings = settings
         self.database = database
@@ -48,6 +79,10 @@ class TranslationChatPipeline:
             timeout=300.0,
             max_retries=1,
         )
+        self.sandbox_settings = sandbox_settings or SandboxSettings.from_env()
+        self.python_sandbox = python_sandbox
+        if self.python_sandbox is None and self.sandbox_settings.enabled:
+            self.python_sandbox = MontyPythonSandbox(self.sandbox_settings)
 
     def translate(
         self,
@@ -89,13 +124,61 @@ class TranslationChatPipeline:
             *self.database.get_pivot_context(conversation_id),
             {"role": "user", "content": user_pivot},
         ]
-        response = self.client.chat.completions.create(
-            model=self.settings.qwen_model,
-            messages=messages,
-            temperature=self.settings.qwen_temperature,
-            max_tokens=self.settings.qwen_max_tokens,
-        )
-        return _completion_text(response)
+        for _ in range(self.sandbox_settings.max_tool_rounds + 1):
+            request: dict[str, Any] = {
+                "model": self.settings.qwen_model,
+                "messages": messages,
+                "temperature": self.settings.qwen_temperature,
+                "max_tokens": self.settings.qwen_max_tokens,
+            }
+            if self.python_sandbox is not None:
+                request["tools"] = [PYTHON_TOOL]
+                request["tool_choice"] = "auto"
+
+            response = self.client.chat.completions.create(**request)
+            if not response.choices:
+                raise RuntimeError("The model returned no choices")
+            message = response.choices[0].message
+            tool_calls = getattr(message, "tool_calls", None) or []
+            if not tool_calls:
+                return _message_text(message)
+
+            messages.append(_assistant_tool_message(message))
+            for tool_call in tool_calls:
+                arguments_json = tool_call.function.arguments
+                result_json = self._execute_tool_call(
+                    tool_call.function.name,
+                    arguments_json,
+                )
+                self.database.record_tool_execution(
+                    conversation_id,
+                    tool_call_id=tool_call.id,
+                    tool_name=tool_call.function.name,
+                    arguments_json=arguments_json,
+                    result_json=result_json,
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result_json,
+                    }
+                )
+
+        raise RuntimeError("The model exceeded the maximum Python tool rounds")
+
+    def _execute_tool_call(self, name: str, arguments_json: str) -> str:
+        if name != "execute_python":
+            return json.dumps({"error": f"Unknown tool: {name}"})
+        if self.python_sandbox is None:
+            return json.dumps({"error": "Python sandbox is disabled"})
+        try:
+            arguments = json.loads(arguments_json)
+            code = arguments["code"]
+            result = self.python_sandbox.execute(code)
+            return json.dumps(result.to_dict(), ensure_ascii=False)
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            return json.dumps({"error": str(error)}, ensure_ascii=False)
 
     def run_turn(self, conversation_id: int, user_ko: str) -> TurnResult:
         user_ko = user_ko.strip()
@@ -105,19 +188,27 @@ class TranslationChatPipeline:
             raise ValueError(f"Conversation {conversation_id} does not exist")
 
         pivot_language = self.database.get_pivot_language(conversation_id)
+        started = perf_counter()
         user_pivot = self.translate(
             user_ko,
             pivot_language,
             prompt_language=pivot_language,
         )
+        input_translation_seconds = perf_counter() - started
+
+        started = perf_counter()
         assistant_pivot = self.answer_in_pivot_language(
             conversation_id, user_pivot, pivot_language
         )
+        qwen_seconds = perf_counter() - started
+
+        started = perf_counter()
         assistant_ko = self.translate(
             assistant_pivot,
             "Korean",
             prompt_language=pivot_language,
         )
+        output_translation_seconds = perf_counter() - started
 
         self.database.append_turn(
             conversation_id,
@@ -132,6 +223,9 @@ class TranslationChatPipeline:
             assistant_pivot=assistant_pivot,
             assistant_ko=assistant_ko,
             pivot_language=pivot_language,
+            input_translation_seconds=input_translation_seconds,
+            qwen_seconds=qwen_seconds,
+            output_translation_seconds=output_translation_seconds,
         )
 
     def list_model_ids(self) -> list[str]:
@@ -145,3 +239,28 @@ def _completion_text(response: Any) -> str:
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError("The model returned an empty text response")
     return content.strip()
+
+
+def _message_text(message: Any) -> str:
+    content = message.content
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("The model returned an empty text response")
+    return content.strip()
+
+
+def _assistant_tool_message(message: Any) -> dict[str, Any]:
+    return {
+        "role": "assistant",
+        "content": message.content,
+        "tool_calls": [
+            {
+                "id": tool_call.id,
+                "type": "function",
+                "function": {
+                    "name": tool_call.function.name,
+                    "arguments": tool_call.function.arguments,
+                },
+            }
+            for tool_call in getattr(message, "tool_calls", None) or []
+        ],
+    }

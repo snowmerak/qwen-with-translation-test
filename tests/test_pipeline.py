@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from qwen_translation_test.config import Settings
 from qwen_translation_test.database import ChatDatabase
 from qwen_translation_test.pipeline import TranslationChatPipeline
+from qwen_translation_test.sandbox import SandboxResult, SandboxSettings
 
 
 class FakeCompletions:
@@ -114,3 +115,82 @@ def test_chinese_pipeline_uses_only_chinese_history(tmp_path: Path) -> None:
         final_hy_prompt = fake_completions.calls[2]["messages"][0]["content"]
         assert first_hy_prompt.startswith("将以下文本翻译为中文")
         assert final_hy_prompt.startswith("将以下文本翻译为韩语")
+
+
+class FakeToolCompletions:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def create(self, **kwargs: object) -> SimpleNamespace:
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            tool_call = SimpleNamespace(
+                id="call_python_1",
+                type="function",
+                function=SimpleNamespace(
+                    name="execute_python",
+                    arguments='{"code":"print(6 * 7)"}',
+                ),
+            )
+            message = SimpleNamespace(content=None, tool_calls=[tool_call])
+        else:
+            message = SimpleNamespace(
+                content="The calculated answer is 42.", tool_calls=None
+            )
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+class FakeSandbox:
+    def __init__(self) -> None:
+        self.codes: list[str] = []
+
+    def execute(self, code: str) -> SandboxResult:
+        self.codes.append(code)
+        return SandboxResult(
+            success=True,
+            result=None,
+            stdout="42\n",
+            stderr="",
+            error=None,
+        )
+
+
+def test_qwen_tool_call_runs_python_and_returns_result(tmp_path: Path) -> None:
+    completions = FakeToolCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    sandbox = FakeSandbox()
+    sandbox_settings = SandboxSettings(
+        enabled=True,
+        timeout_seconds=1,
+        max_memory_bytes=16 * 1024 * 1024,
+        max_recursion_depth=100,
+        max_code_chars=2_000,
+        max_output_bytes=2_000,
+        max_tool_rounds=2,
+    )
+
+    with ChatDatabase(tmp_path / "test.db") as database:
+        conversation_id = database.create_conversation("English")
+        pipeline = TranslationChatPipeline(
+            settings(tmp_path / "test.db"),
+            database,
+            client,
+            sandbox_settings=sandbox_settings,
+            python_sandbox=sandbox,
+        )
+
+        answer = pipeline.answer_in_pivot_language(
+            conversation_id, "Calculate 6 * 7 with Python.", "English"
+        )
+
+        assert answer == "The calculated answer is 42."
+        assert sandbox.codes == ["print(6 * 7)"]
+        assert "tools" in completions.calls[0]
+        second_messages = completions.calls[1]["messages"]
+        assert second_messages[-1]["role"] == "tool"
+        assert "42" in second_messages[-1]["content"]
+        stored = database.connection.execute(
+            "SELECT tool_name, arguments_json, result_json FROM tool_executions"
+        ).fetchone()
+        assert stored["tool_name"] == "execute_python"
+        assert "print(6 * 7)" in stored["arguments_json"]

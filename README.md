@@ -110,6 +110,28 @@ uv run qwen-translate-chat --list-models
 uv run pytest
 ```
 
+## 영어/중국어 피벗 벤치마크
+
+10개 한국어 케이스를 각각 4회 반복하며, 매 반복에서 영어와 중국어 피벗을
+모두 실행합니다. 결과는 40개의 비교 레코드로 저장되며 각 레코드에는 두 피벗의
+중간 번역, Qwen 원문, 최종 한국어와 단계별 소요 시간이 함께 들어갑니다.
+
+```powershell
+uv run qwen-translate-benchmark
+```
+
+기본 결과 파일은 `results/pivot_benchmark.jsonl`, 대화 원본은
+`benchmark.db`에 저장됩니다. 사람이 나란히 평가하기 위한
+`results/pivot_benchmark.csv`도 함께 생성되며, 영어/중국어 품질 점수와 선호
+피벗, 평가 메모 열은 비워 둡니다. 실행이 중단되면 같은 명령으로 완료되지 않은
+레코드부터 이어서 실행합니다. 벤치마크에서는 비정상적으로 긴 생성을 막기 위해
+Hy와 Qwen 모두 기본 최대 출력이 1,024토큰으로 제한됩니다. 한 레코드만
+시험하려면 다음처럼 실행합니다.
+
+```powershell
+uv run qwen-translate-benchmark --limit 1
+```
+
 ## Hy 모델 로드 문제
 
 이 MLX 변환본에는 `hy_v3.py` 커스텀 모델 코드가 포함되어 있습니다. oMLX에서

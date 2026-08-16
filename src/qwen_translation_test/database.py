@@ -51,6 +51,21 @@ class ChatDatabase:
 
             CREATE INDEX IF NOT EXISTS idx_messages_conversation
                 ON messages(conversation_id, sequence);
+
+            CREATE TABLE IF NOT EXISTS tool_executions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                tool_call_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                arguments_json TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (conversation_id)
+                    REFERENCES conversations(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tool_executions_conversation
+                ON tool_executions(conversation_id, id);
             """
         )
         self._migrate_english_schema()
@@ -191,6 +206,35 @@ class ChatDatabase:
             ORDER BY c.updated_at DESC, c.id DESC
             """
         ).fetchall()
+
+    def record_tool_execution(
+        self,
+        conversation_id: int,
+        *,
+        tool_call_id: str,
+        tool_name: str,
+        arguments_json: str,
+        result_json: str,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO tool_executions(
+                conversation_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+                result_json
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                conversation_id,
+                tool_call_id,
+                tool_name,
+                arguments_json,
+                result_json,
+            ),
+        )
+        self.connection.commit()
 
     def close(self) -> None:
         self.connection.close()
