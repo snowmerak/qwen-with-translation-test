@@ -236,6 +236,17 @@ class ChatDatabase:
         )
         self.connection.commit()
 
+    def get_tool_executions(self, conversation_id: int) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """
+            SELECT tool_call_id, tool_name, arguments_json, result_json, created_at
+            FROM tool_executions
+            WHERE conversation_id = ?
+            ORDER BY id
+            """,
+            (conversation_id,),
+        ).fetchall()
+
     def close(self) -> None:
         self.connection.close()
 

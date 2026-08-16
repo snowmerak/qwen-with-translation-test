@@ -68,8 +68,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=1024,
-        help="Maximum output tokens for both Hy and Qwen (default: 1024).",
+        help="Legacy override for both Hy and Qwen output limits.",
+    )
+    parser.add_argument(
+        "--hy-max-tokens",
+        type=int,
+        help="Override the Hy translation output limit.",
+    )
+    parser.add_argument(
+        "--qwen-max-tokens",
+        type=int,
+        help="Override the Qwen output limit, including thinking tokens.",
     )
     return parser
 
@@ -80,17 +89,32 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("error: --runs must be at least 1")
     if args.limit is not None and args.limit < 1:
         raise SystemExit("error: --limit must be at least 1")
-    if args.max_tokens < 1:
-        raise SystemExit("error: --max-tokens must be at least 1")
+    for name in ("max_tokens", "hy_max_tokens", "qwen_max_tokens"):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            raise SystemExit(f"error: --{name.replace('_', '-')} must be at least 1")
 
     try:
         cases = load_cases(args.cases)
         completed = load_completed_keys(args.output)
         args.output.parent.mkdir(parents=True, exist_ok=True)
+        base_settings = Settings.from_env()
         settings = replace(
-            Settings.from_env(),
-            hy_max_tokens=args.max_tokens,
-            qwen_max_tokens=args.max_tokens,
+            base_settings,
+            hy_max_tokens=(
+                args.hy_max_tokens
+                if args.hy_max_tokens is not None
+                else args.max_tokens
+                if args.max_tokens is not None
+                else base_settings.hy_max_tokens
+            ),
+            qwen_max_tokens=(
+                args.qwen_max_tokens
+                if args.qwen_max_tokens is not None
+                else args.max_tokens
+                if args.max_tokens is not None
+                else base_settings.qwen_max_tokens
+            ),
         )
 
         all_records = [
@@ -192,6 +216,9 @@ def run_paired_record(
             result,
             conversation_id=conversation_id,
             total_seconds=perf_counter() - started,
+            tool_executions=serialize_tool_executions(
+                database.get_tool_executions(conversation_id)
+            ),
         )
 
     return {
@@ -200,6 +227,10 @@ def run_paired_record(
         "repetition": repetition,
         "request_ko": case.request_ko,
         "execution_order": languages,
+        "python_tool_enabled": pipeline.python_sandbox is not None,
+        "hy_max_tokens": pipeline.settings.hy_max_tokens,
+        "qwen_max_tokens": pipeline.settings.qwen_max_tokens,
+        "qwen_temperature": pipeline.settings.qwen_temperature,
         "created_at": datetime.now(UTC).isoformat(),
         "english": results["english"],
         "chinese": results["chinese"],
@@ -211,14 +242,42 @@ def serialize_result(
     *,
     conversation_id: int,
     total_seconds: float,
+    tool_executions: list[dict[str, Any]],
 ) -> dict[str, Any]:
     data = asdict(result)
     data["conversation_id"] = conversation_id
     data["total_seconds"] = total_seconds
+    data["tool_call_count"] = len(tool_executions)
+    data["tool_executions"] = tool_executions
+    data["thinking_observed"] = bool(data.get("assistant_reasoning"))
     for key, value in list(data.items()):
         if key.endswith("_seconds"):
             data[key] = round(float(value), 4)
     return data
+
+
+def serialize_tool_executions(rows: list[Any]) -> list[dict[str, Any]]:
+    executions: list[dict[str, Any]] = []
+    for row in rows:
+        arguments = _parse_json_field(row["arguments_json"])
+        result = _parse_json_field(row["result_json"])
+        executions.append(
+            {
+                "tool_call_id": row["tool_call_id"],
+                "tool_name": row["tool_name"],
+                "arguments": arguments,
+                "result": result,
+                "created_at": row["created_at"],
+            }
+        )
+    return executions
+
+
+def _parse_json_field(value: str) -> Any:
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
 
 
 def append_record(path: Path, record: dict[str, Any]) -> None:
@@ -239,12 +298,20 @@ def export_csv(jsonl_path: Path, csv_path: Path) -> None:
         "request_ko",
         "english_input_pivot",
         "english_qwen_pivot",
+        "english_qwen_reasoning",
         "english_final_ko",
         "chinese_input_pivot",
         "chinese_qwen_pivot",
+        "chinese_qwen_reasoning",
         "chinese_final_ko",
         "english_total_seconds",
         "chinese_total_seconds",
+        "english_tool_call_count",
+        "english_tool_codes",
+        "english_tool_results",
+        "chinese_tool_call_count",
+        "chinese_tool_codes",
+        "chinese_tool_results",
         "english_final_chars",
         "chinese_final_chars",
         "final_length_delta",
@@ -270,12 +337,24 @@ def export_csv(jsonl_path: Path, csv_path: Path) -> None:
                     "request_ko": record["request_ko"],
                     "english_input_pivot": english["user_pivot"],
                     "english_qwen_pivot": english["assistant_pivot"],
+                    "english_qwen_reasoning": english.get(
+                        "assistant_reasoning", ""
+                    ),
                     "english_final_ko": english_final,
                     "chinese_input_pivot": chinese["user_pivot"],
                     "chinese_qwen_pivot": chinese["assistant_pivot"],
+                    "chinese_qwen_reasoning": chinese.get(
+                        "assistant_reasoning", ""
+                    ),
                     "chinese_final_ko": chinese_final,
                     "english_total_seconds": english["total_seconds"],
                     "chinese_total_seconds": chinese["total_seconds"],
+                    "english_tool_call_count": english.get("tool_call_count", 0),
+                    "english_tool_codes": _tool_codes_for_csv(english),
+                    "english_tool_results": _tool_results_for_csv(english),
+                    "chinese_tool_call_count": chinese.get("tool_call_count", 0),
+                    "chinese_tool_codes": _tool_codes_for_csv(chinese),
+                    "chinese_tool_results": _tool_results_for_csv(chinese),
                     "english_final_chars": len(english_final),
                     "chinese_final_chars": len(chinese_final),
                     "final_length_delta": len(chinese_final) - len(english_final),
@@ -285,6 +364,23 @@ def export_csv(jsonl_path: Path, csv_path: Path) -> None:
                     "evaluator_notes": "",
                 }
             )
+
+
+def _tool_codes_for_csv(result: dict[str, Any]) -> str:
+    codes = [
+        execution.get("arguments", {}).get("code", "")
+        for execution in result.get("tool_executions", [])
+        if isinstance(execution.get("arguments"), dict)
+    ]
+    return json.dumps(codes, ensure_ascii=False)
+
+
+def _tool_results_for_csv(result: dict[str, Any]) -> str:
+    results = [
+        execution.get("result")
+        for execution in result.get("tool_executions", [])
+    ]
+    return json.dumps(results, ensure_ascii=False)
 
 
 if __name__ == "__main__":

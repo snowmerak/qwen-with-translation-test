@@ -186,6 +186,10 @@ def test_qwen_tool_call_runs_python_and_returns_result(tmp_path: Path) -> None:
         assert answer == "The calculated answer is 42."
         assert sandbox.codes == ["print(6 * 7)"]
         assert "tools" in completions.calls[0]
+        tool_description = completions.calls[0]["tools"][0]["function"][
+            "description"
+        ]
+        assert tool_description.startswith("Execute a restricted Python subset")
         second_messages = completions.calls[1]["messages"]
         assert second_messages[-1]["role"] == "tool"
         assert "42" in second_messages[-1]["content"]
@@ -194,3 +198,74 @@ def test_qwen_tool_call_runs_python_and_returns_result(tmp_path: Path) -> None:
         ).fetchone()
         assert stored["tool_name"] == "execute_python"
         assert "print(6 * 7)" in stored["arguments_json"]
+        assert len(database.get_tool_executions(conversation_id)) == 1
+
+
+def test_chinese_qwen_receives_chinese_python_tool_description(
+    tmp_path: Path,
+) -> None:
+    completions = FakeToolCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    sandbox = FakeSandbox()
+    sandbox_settings = SandboxSettings(
+        enabled=True,
+        timeout_seconds=1,
+        max_memory_bytes=16 * 1024 * 1024,
+        max_recursion_depth=100,
+        max_code_chars=2_000,
+        max_output_bytes=2_000,
+        max_tool_rounds=2,
+    )
+
+    with ChatDatabase(tmp_path / "test.db") as database:
+        conversation_id = database.create_conversation("Chinese")
+        pipeline = TranslationChatPipeline(
+            settings(tmp_path / "test.db"),
+            database,
+            client,
+            sandbox_settings=sandbox_settings,
+            python_sandbox=sandbox,
+        )
+
+        pipeline.answer_in_pivot_language(
+            conversation_id, "请用 Python 计算 6 * 7。", "Chinese"
+        )
+
+        description = completions.calls[0]["tools"][0]["function"][
+            "description"
+        ]
+        assert description.startswith("在隔离的 Monty 工作进程中")
+
+
+class FakeReasoningCompletions:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def create(self, **_: object) -> SimpleNamespace:
+        self.calls += 1
+        if self.calls == 1:
+            message = SimpleNamespace(content="What is 6 * 7?")
+        elif self.calls == 2:
+            message = SimpleNamespace(
+                content="The answer is 42.",
+                reasoning_content="I should multiply 6 by 7.",
+                tool_calls=None,
+            )
+        else:
+            message = SimpleNamespace(content="정답은 42입니다.")
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def test_pipeline_captures_qwen_reasoning_content(tmp_path: Path) -> None:
+    completions = FakeReasoningCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    with ChatDatabase(tmp_path / "test.db") as database:
+        conversation_id = database.create_conversation("English")
+        pipeline = TranslationChatPipeline(
+            settings(tmp_path / "test.db"), database, client
+        )
+
+        result = pipeline.run_turn(conversation_id, "6 곱하기 7은?")
+
+        assert result.assistant_reasoning == "I should multiply 6 by 7."

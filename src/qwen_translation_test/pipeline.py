@@ -26,13 +26,14 @@ CHINESE_LANGUAGE_NAMES = {
     "Korean": "韩语",
 }
 
-PYTHON_TOOL = {
+PYTHON_TOOL_ENGLISH = {
     "type": "function",
     "function": {
         "name": "execute_python",
         "description": (
-            "Execute Python 3.11 code in an isolated, network-disabled container. "
-            "Use it for calculations, data processing, or verifying code. "
+            "Execute a restricted Python subset in a host-isolated Monty worker. "
+            "There is no filesystem, environment, network, or third-party package "
+            "access. Use it for calculations, data processing, or verifying code. "
             "Print the values needed to answer the user."
         ),
         "parameters": {
@@ -49,17 +50,47 @@ PYTHON_TOOL = {
     },
 }
 
+PYTHON_TOOL_CHINESE = {
+    "type": "function",
+    "function": {
+        "name": "execute_python",
+        "description": (
+            "在隔离的 Monty 工作进程中执行受限的 Python 子集。"
+            "无法访问文件系统、环境变量、网络或第三方包。"
+            "适合用于计算、数据处理或验证代码。请打印回答用户所需的值。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "要执行的完整 Python 源代码。",
+                }
+            },
+            "required": ["code"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 
 @dataclass(frozen=True, slots=True)
 class TurnResult:
     user_ko: str
     user_pivot: str
+    assistant_reasoning: str | None
     assistant_pivot: str
     assistant_ko: str
     pivot_language: str
     input_translation_seconds: float
     qwen_seconds: float
     output_translation_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class QwenAnswer:
+    content: str
+    reasoning: str | None
 
 
 class TranslationChatPipeline:
@@ -116,6 +147,16 @@ class TranslationChatPipeline:
         user_pivot: str,
         pivot_language: str,
     ) -> str:
+        return self._answer_with_reasoning(
+            conversation_id, user_pivot, pivot_language
+        ).content
+
+    def _answer_with_reasoning(
+        self,
+        conversation_id: int,
+        user_pivot: str,
+        pivot_language: str,
+    ) -> QwenAnswer:
         system_prompt = self.settings.qwen_system_prompt.replace(
             "{pivot_language}", pivot_language
         )
@@ -124,6 +165,7 @@ class TranslationChatPipeline:
             *self.database.get_pivot_context(conversation_id),
             {"role": "user", "content": user_pivot},
         ]
+        reasoning_parts: list[str] = []
         for _ in range(self.sandbox_settings.max_tool_rounds + 1):
             request: dict[str, Any] = {
                 "model": self.settings.qwen_model,
@@ -132,16 +174,26 @@ class TranslationChatPipeline:
                 "max_tokens": self.settings.qwen_max_tokens,
             }
             if self.python_sandbox is not None:
-                request["tools"] = [PYTHON_TOOL]
+                request["tools"] = [
+                    PYTHON_TOOL_CHINESE
+                    if pivot_language == "Chinese"
+                    else PYTHON_TOOL_ENGLISH
+                ]
                 request["tool_choice"] = "auto"
 
             response = self.client.chat.completions.create(**request)
             if not response.choices:
                 raise RuntimeError("The model returned no choices")
             message = response.choices[0].message
+            reasoning = _message_reasoning(message)
+            if reasoning:
+                reasoning_parts.append(reasoning)
             tool_calls = getattr(message, "tool_calls", None) or []
             if not tool_calls:
-                return _message_text(message)
+                return QwenAnswer(
+                    content=_message_text(message),
+                    reasoning=("\n\n".join(reasoning_parts) or None),
+                )
 
             messages.append(_assistant_tool_message(message))
             for tool_call in tool_calls:
@@ -197,9 +249,10 @@ class TranslationChatPipeline:
         input_translation_seconds = perf_counter() - started
 
         started = perf_counter()
-        assistant_pivot = self.answer_in_pivot_language(
+        answer = self._answer_with_reasoning(
             conversation_id, user_pivot, pivot_language
         )
+        assistant_pivot = answer.content
         qwen_seconds = perf_counter() - started
 
         started = perf_counter()
@@ -220,6 +273,7 @@ class TranslationChatPipeline:
         return TurnResult(
             user_ko=user_ko,
             user_pivot=user_pivot,
+            assistant_reasoning=answer.reasoning,
             assistant_pivot=assistant_pivot,
             assistant_ko=assistant_ko,
             pivot_language=pivot_language,
@@ -248,8 +302,15 @@ def _message_text(message: Any) -> str:
     return content.strip()
 
 
+def _message_reasoning(message: Any) -> str | None:
+    reasoning = getattr(message, "reasoning_content", None)
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning.strip()
+    return None
+
+
 def _assistant_tool_message(message: Any) -> dict[str, Any]:
-    return {
+    data = {
         "role": "assistant",
         "content": message.content,
         "tool_calls": [
@@ -264,3 +325,7 @@ def _assistant_tool_message(message: Any) -> dict[str, Any]:
             for tool_call in getattr(message, "tool_calls", None) or []
         ],
     }
+    reasoning = _message_reasoning(message)
+    if reasoning:
+        data["reasoning_content"] = reasoning
+    return data

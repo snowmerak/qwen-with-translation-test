@@ -32,7 +32,7 @@ class Settings:
             qwen_model=os.getenv("QWEN_MODEL", "Qwen3.8-27B-4bit"),
             database_path=Path(os.getenv("DATABASE_PATH", "chat.db")),
             hy_max_tokens=_int_env("HY_MAX_TOKENS", 4096),
-            qwen_max_tokens=_int_env("QWEN_MAX_TOKENS", 4096),
+            qwen_max_tokens=_int_env("QWEN_MAX_TOKENS", 32768),
             qwen_temperature=_float_env("QWEN_TEMPERATURE", 0.7),
             qwen_system_prompt=os.getenv(
                 "QWEN_SYSTEM_PROMPT",
