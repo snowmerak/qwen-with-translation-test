@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from qwen_translation_test.config import Settings
 from qwen_translation_test.database import ChatDatabase
 from qwen_translation_test.pipeline import TranslationChatPipeline
@@ -115,6 +117,92 @@ def test_chinese_pipeline_uses_only_chinese_history(tmp_path: Path) -> None:
         final_hy_prompt = fake_completions.calls[2]["messages"][0]["content"]
         assert first_hy_prompt.startswith("将以下文本翻译为中文")
         assert final_hy_prompt.startswith("将以下文本翻译为韩语")
+
+
+@pytest.mark.parametrize(
+    ("pivot_language", "outputs", "input_prompt", "output_prompt"),
+    [
+        (
+            "Korean",
+            ["번역된 질문", "한국어 답변", "다듬은 한국어 답변"],
+            "다음 텍스트를 한국어로 번역하세요",
+            "다음 텍스트를 한국어로 번역하세요",
+        ),
+        (
+            "Japanese",
+            ["翻訳された質問", "日本語の回答", "번역된 한국어 답변"],
+            "次のテキストを日本語に翻訳してください",
+            "次のテキストを韓国語に翻訳してください",
+        ),
+    ],
+)
+def test_additional_pivots_still_translate_both_directions(
+    tmp_path: Path,
+    pivot_language: str,
+    outputs: list[str],
+    input_prompt: str,
+    output_prompt: str,
+) -> None:
+    completions = FakeCompletions(outputs)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    with ChatDatabase(tmp_path / "test.db") as database:
+        conversation_id = database.create_conversation(pivot_language)
+        pipeline = TranslationChatPipeline(
+            settings(tmp_path / "test.db"), database, client
+        )
+
+        result = pipeline.run_turn(conversation_id, "원문 질문")
+
+        assert [call["model"] for call in completions.calls] == [
+            "hy",
+            "qwen",
+            "hy",
+        ]
+        assert result.translation_bypassed is False
+        assert completions.calls[0]["messages"][0]["content"].startswith(
+            input_prompt
+        )
+        assert completions.calls[2]["messages"][0]["content"].startswith(
+            output_prompt
+        )
+        assert completions.calls[1]["messages"][0] == {
+            "role": "system",
+            "content": f"Answer clearly in {pivot_language}.",
+        }
+
+
+def test_bypass_calls_only_qwen_and_keeps_korean_verbatim(
+    tmp_path: Path,
+) -> None:
+    completions = FakeCompletions(["Qwen의 한국어 답변"])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    with ChatDatabase(tmp_path / "test.db") as database:
+        conversation_id = database.create_conversation(
+            "Korean", translation_bypass=True
+        )
+        pipeline = TranslationChatPipeline(
+            settings(tmp_path / "test.db"), database, client
+        )
+
+        result = pipeline.run_turn(conversation_id, "한국어 원문")
+
+        assert [call["model"] for call in completions.calls] == ["qwen"]
+        assert completions.calls[0]["messages"] == [
+            {"role": "system", "content": "Answer clearly in Korean."},
+            {"role": "user", "content": "한국어 원문"},
+        ]
+        assert result.user_pivot == "한국어 원문"
+        assert result.assistant_pivot == "Qwen의 한국어 답변"
+        assert result.assistant_ko == "Qwen의 한국어 답변"
+        assert result.translation_bypassed is True
+        assert result.input_translation_seconds == 0.0
+        assert result.output_translation_seconds == 0.0
+        assert database.get_pivot_context(conversation_id) == [
+            {"role": "user", "content": "한국어 원문"},
+            {"role": "assistant", "content": "Qwen의 한국어 답변"},
+        ]
 
 
 class FakeToolCompletions:

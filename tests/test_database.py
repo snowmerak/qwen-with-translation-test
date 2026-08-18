@@ -28,6 +28,19 @@ def test_stores_bilingual_pairs_and_builds_pivot_context(tmp_path: Path) -> None
         assert stored[1].content_pivot == "你好！有什么可以帮助你的？"
 
 
+def test_stores_translation_bypass_on_conversation(tmp_path: Path) -> None:
+    with ChatDatabase(tmp_path / "test.db") as database:
+        translated_id = database.create_conversation("Korean")
+        bypass_id = database.create_conversation(
+            "Korean", translation_bypass=True
+        )
+
+        assert database.is_translation_bypassed(translated_id) is False
+        assert database.is_translation_bypassed(bypass_id) is True
+        rows = {row["id"]: row for row in database.list_conversations()}
+        assert rows[bypass_id]["translation_bypass"] == 1
+
+
 def test_migrates_existing_english_database(tmp_path: Path) -> None:
     path = tmp_path / "legacy.db"
     connection = sqlite3.connect(path)
@@ -58,4 +71,5 @@ def test_migrates_existing_english_database(tmp_path: Path) -> None:
 
     with ChatDatabase(path) as database:
         assert database.get_pivot_language(1) == "English"
+        assert database.is_translation_bypassed(1) is False
         assert database.get_messages(1)[0].content_pivot == "Hello"

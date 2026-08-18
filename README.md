@@ -1,7 +1,9 @@
 # Qwen with translation test
 
-한국어 요청을 Hy-MT2로 영어 또는 중국어로 번역한 뒤 Qwen에 전달하고,
-Qwen 응답을 다시 Hy-MT2로 한국어로 번역하는 작은 비교 실험용 CLI입니다.
+한국어 요청을 Hy-MT2로 영어, 중국어, 한국어 또는 일본어로 번역한 뒤 Qwen에
+전달하고, Qwen 응답을 다시 Hy-MT2로 한국어로 번역하는 비교 실험용 CLI입니다.
+번역 효과를 비교할 수 있도록 Hy-MT2를 완전히 생략하는 별도 bypass 모드도
+지원합니다.
 
 Qwen에는 선택한 피벗 언어의 대화 이력만 전달합니다. SQLite에는 원문과
 번역문을 함께 저장하므로 실제 입력도 나중에 확인할 수 있습니다. 한 conversation
@@ -11,15 +13,20 @@ Qwen에는 선택한 피벗 언어의 대화 이력만 전달합니다. SQLite�
 
 ```text
 한국어 입력
-  -> Hy-MT2 (Korean -> English 또는 Chinese)
+  -> Hy-MT2 (Korean -> English, Chinese, Korean 또는 Japanese)
   -> Qwen (선택한 피벗 언어 컨텍스트로 응답)
   -> Hy-MT2 (피벗 언어 -> Korean)
   -> 최종 한국어 응답 출력
 ```
 
+`Korean` 피벗도 Hy-MT2의 `Korean -> Korean` 번역과 `Korean -> Korean`
+역번역을 모두 거칩니다. 번역 호출 없이 한국어를 Qwen에 직접 전달하려면
+피벗 언어가 아니라 `--bypass-translation` 옵션을 사용합니다.
+
 Hy-MT2 호출에는 Tencent가 공개한 기본 번역 지시문을 사용합니다. 별도의
-시스템 프롬프트는 넣지 않습니다. 영어 피벗은 영문 지시문을, 중국어 피벗은
-아래와 같은 중문 지시문을 양방향 번역에 사용합니다.
+시스템 프롬프트는 넣지 않습니다. 영어, 중국어, 한국어, 일본어 피벗은 각각
+해당 언어로 작성된 번역 지시문을 양방향 번역에 사용합니다. 예를 들어 중국어
+지시문은 다음과 같습니다.
 
 ```text
 将以下文本翻译为中文，注意只需要输出翻译后的结果，不要额外解释：
@@ -58,10 +65,23 @@ PIVOT_LANGUAGE=English
 uv run qwen-translate-chat
 ```
 
-중국어 피벗으로 시작하려면 다음 옵션을 사용합니다.
+피벗 언어를 선택하려면 다음 옵션을 사용합니다. `한국어`, `일어`, `ko`, `ja`
+같은 별칭도 사용할 수 있습니다.
 
 ```powershell
 uv run qwen-translate-chat --pivot-language chinese
+uv run qwen-translate-chat --pivot-language korean
+uv run qwen-translate-chat --pivot-language japanese
+```
+
+Hy-MT2를 호출하지 않고 한국어 입출력을 Qwen에 직접 전달하는 새 대화를
+시작하려면 별도 bypass 옵션을 사용합니다. 이 모드는 대화에 저장되므로 해당
+conversation을 재개해도 계속 유지됩니다.
+
+```powershell
+uv run qwen-translate-chat --bypass-translation
+# 짧은 별칭
+uv run qwen-translate-chat --bypass
 ```
 
 한 번만 요청하려면 다음과 같이 실행합니다. 이 모드의 표준 출력에는 최종
@@ -98,8 +118,12 @@ uv run qwen-translate-chat --list-models
 `messages` 테이블의 각 행에는 아래 값이 함께 저장됩니다.
 
 - `role`: `user` 또는 `assistant`
-- `content_pivot`: Qwen 컨텍스트에 사용하는 영어 또는 중국어 메시지
+- `content_pivot`: Qwen 컨텍스트에 사용하는 피벗 언어 메시지
 - `content_ko`: 사용자 원문 또는 최종 한국어 번역
+
+`conversations.translation_bypass`에는 해당 대화가 Hy-MT2를 생략하는지
+저장됩니다. bypass 대화에서는 `content_pivot`과 `content_ko`가 같은 한국어
+내용입니다.
 
 기존 `content_en` 기반 DB는 처음 열 때 `content_pivot` 구조로 자동
 마이그레이션되며 기존 conversation은 영어 피벗으로 유지됩니다.
@@ -110,22 +134,32 @@ uv run qwen-translate-chat --list-models
 uv run pytest
 ```
 
-## 영어/중국어 피벗 벤치마크
+## 피벗 및 bypass 벤치마크
 
-10개 한국어 케이스를 각각 4회 반복하며, 매 반복에서 영어와 중국어 피벗을
-모두 실행합니다. 결과는 40개의 비교 레코드로 저장되며 각 레코드에는 두 피벗의
-중간 번역, Qwen 원문, 최종 한국어와 단계별 소요 시간이 함께 들어갑니다.
+10개 한국어 케이스를 각각 4회 반복하며, 기본적으로 매 반복에서 영어, 중국어,
+한국어, 일본어 피벗을 모두 실행합니다. 결과는 40개의 비교 레코드로 저장되며
+각 레코드에는 네 피벗의 중간 번역, Qwen 원문, 최종 한국어와 단계별 소요 시간이
+함께 들어갑니다.
 
 ```powershell
 uv run qwen-translate-benchmark
 ```
 
+비교할 피벗을 제한하거나 번역 bypass 결과까지 포함할 수 있습니다.
+
+```powershell
+uv run qwen-translate-benchmark `
+  --pivot-languages English Chinese Korean Japanese `
+  --include-bypass
+```
+
 기본 결과 파일은 `results/pivot_benchmark.jsonl`, 대화 원본은
 `benchmark.db`에 저장됩니다. 사람이 나란히 평가하기 위한
-`results/pivot_benchmark.csv`도 함께 생성되며, 영어/중국어 품질 점수와 선호
-피벗, 평가 메모 열은 비워 둡니다. 실행이 중단되면 같은 명령으로 완료되지 않은
-레코드부터 이어서 실행합니다. 출력 한도는 `.env`의 `HY_MAX_TOKENS`와
-`QWEN_MAX_TOKENS`를 따르며, 기본값은 각각 4,096과 32,768입니다. thinking
+`results/pivot_benchmark.csv`도 함께 생성되며, 각 비교 모드의 품질 점수와 선호
+모드, 평가 메모 열은 비워 둡니다. 실행이 중단되면 같은 비교 모드 조합으로
+완료되지 않은 레코드부터 이어서 실행합니다. 출력 한도는 `.env`의
+`HY_MAX_TOKENS`와 `QWEN_MAX_TOKENS`를 따르며, 기본값은 각각 4,096과
+32,768입니다. thinking
 토큰을 충분히 허용하기 위해 Qwen 한도를 더 크게 둡니다. 한 레코드만 시험하려면
 다음처럼 실행합니다.
 

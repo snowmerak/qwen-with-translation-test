@@ -7,6 +7,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+SUPPORTED_PIVOT_LANGUAGES = ("English", "Chinese", "Korean", "Japanese")
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     base_url: str
@@ -74,11 +77,20 @@ def normalize_pivot_language(value: str) -> str:
         "zh-cn": "Chinese",
         "chinese": "Chinese",
         "중국어": "Chinese",
+        "ko": "Korean",
+        "kr": "Korean",
+        "korean": "Korean",
+        "한국어": "Korean",
+        "ja": "Japanese",
+        "jp": "Japanese",
+        "japanese": "Japanese",
+        "일본어": "Japanese",
+        "일어": "Japanese",
     }
     normalized = aliases.get(value.strip().lower())
     if normalized is None:
         raise ValueError(
-            "PIVOT_LANGUAGE must be English or Chinese, "
+            "PIVOT_LANGUAGE must be English, Chinese, Korean, or Japanese, "
             f"got {value!r}"
         )
     return normalized

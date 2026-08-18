@@ -12,7 +12,11 @@ from typing import Any
 
 from openai import OpenAIError
 
-from .config import Settings
+from .config import (
+    SUPPORTED_PIVOT_LANGUAGES,
+    Settings,
+    normalize_pivot_language,
+)
 from .database import ChatDatabase
 from .pipeline import TranslationChatPipeline, TurnResult
 
@@ -26,9 +30,7 @@ class BenchmarkCase:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Run paired English/Chinese pivot comparisons for Korean prompts."
-        )
+        description="Compare pivot translations for Korean prompts."
     )
     parser.add_argument(
         "--cases",
@@ -41,6 +43,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4,
         help="Repetitions per case (default: 4).",
+    )
+    parser.add_argument(
+        "--pivot-languages",
+        nargs="+",
+        type=normalize_pivot_language,
+        choices=SUPPORTED_PIVOT_LANGUAGES,
+        default=list(SUPPORTED_PIVOT_LANGUAGES),
+        help=(
+            "Pivot languages to compare (default: English Chinese Korean "
+            "Japanese)."
+        ),
+    )
+    parser.add_argument(
+        "--include-bypass",
+        action="store_true",
+        help="Also benchmark direct Korean Qwen calls without Hy-MT2.",
     )
     parser.add_argument(
         "--output",
@@ -63,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--limit",
         type=int,
-        help="Run only the first N paired records (useful for a smoke test).",
+        help="Run only the first N comparison records (useful for a smoke test).",
     )
     parser.add_argument(
         "--max-tokens",
@@ -89,6 +107,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("error: --runs must be at least 1")
     if args.limit is not None and args.limit < 1:
         raise SystemExit("error: --limit must be at least 1")
+    if len(set(args.pivot_languages)) != len(args.pivot_languages):
+        raise SystemExit("error: --pivot-languages must not contain duplicates")
     for name in ("max_tokens", "hy_max_tokens", "qwen_max_tokens"):
         value = getattr(args, name)
         if value is not None and value < 1:
@@ -96,7 +116,10 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         cases = load_cases(args.cases)
-        completed = load_completed_keys(args.output)
+        comparison_modes = [*args.pivot_languages]
+        if args.include_bypass:
+            comparison_modes.append("Bypass")
+        completed = load_completed_keys(args.output, comparison_modes)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         base_settings = Settings.from_env()
         settings = replace(
@@ -145,12 +168,14 @@ def main(argv: list[str] | None = None) -> None:
             for position, (ordinal, case, repetition) in enumerate(
                 scheduled, start=1
             ):
-                record = run_paired_record(
+                record = run_comparison_record(
                     pipeline,
                     database,
                     case,
                     repetition,
                     sequence=ordinal,
+                    pivot_languages=args.pivot_languages,
+                    include_bypass=args.include_bypass,
                 )
                 append_record(args.output, record)
                 print(
@@ -174,7 +199,10 @@ def load_cases(path: Path) -> list[BenchmarkCase]:
     return cases
 
 
-def load_completed_keys(path: Path) -> set[tuple[str, int]]:
+def load_completed_keys(
+    path: Path,
+    comparison_modes: list[str] | None = None,
+) -> set[tuple[str, int]]:
     if not path.exists():
         return set()
     completed: set[tuple[str, int]] = set()
@@ -185,7 +213,13 @@ def load_completed_keys(path: Path) -> set[tuple[str, int]]:
             continue
         try:
             record = json.loads(line)
-            completed.add((str(record["case_id"]), int(record["repetition"])))
+            record_modes = record.get(
+                "comparison_modes", ["English", "Chinese"]
+            )
+            if comparison_modes is None or record_modes == comparison_modes:
+                completed.add(
+                    (str(record["case_id"]), int(record["repetition"]))
+                )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise ValueError(
                 f"Invalid JSONL record at {path}:{line_number}"
@@ -193,26 +227,37 @@ def load_completed_keys(path: Path) -> set[tuple[str, int]]:
     return completed
 
 
-def run_paired_record(
+def run_comparison_record(
     pipeline: TranslationChatPipeline,
     database: ChatDatabase,
     case: BenchmarkCase,
     repetition: int,
     *,
     sequence: int,
+    pivot_languages: list[str] | None = None,
+    include_bypass: bool = False,
 ) -> dict[str, Any]:
-    languages = (
-        ["English", "Chinese"]
+    configured_modes = list(pivot_languages or SUPPORTED_PIVOT_LANGUAGES)
+    if include_bypass:
+        configured_modes.append("Bypass")
+    modes = (
+        configured_modes
         if sequence % 2 == 1
-        else ["Chinese", "English"]
+        else list(reversed(configured_modes))
     )
     results: dict[str, Any] = {}
-    for language in languages:
-        title = f"benchmark:{case.id}:run-{repetition}:{language}"
-        conversation_id = database.create_conversation(language, title)
+    for mode in modes:
+        bypass = mode == "Bypass"
+        pivot_language = "Korean" if bypass else mode
+        title = f"benchmark:{case.id}:run-{repetition}:{mode}"
+        conversation_id = database.create_conversation(
+            pivot_language,
+            title,
+            translation_bypass=bypass,
+        )
         started = perf_counter()
         result = pipeline.run_turn(conversation_id, case.request_ko)
-        results[language.lower()] = serialize_result(
+        results[mode.lower()] = serialize_result(
             result,
             conversation_id=conversation_id,
             total_seconds=perf_counter() - started,
@@ -226,14 +271,14 @@ def run_paired_record(
         "category": case.category,
         "repetition": repetition,
         "request_ko": case.request_ko,
-        "execution_order": languages,
+        "comparison_modes": configured_modes,
+        "execution_order": modes,
         "python_tool_enabled": pipeline.python_sandbox is not None,
         "hy_max_tokens": pipeline.settings.hy_max_tokens,
         "qwen_max_tokens": pipeline.settings.qwen_max_tokens,
         "qwen_temperature": pipeline.settings.qwen_temperature,
         "created_at": datetime.now(UTC).isoformat(),
-        "english": results["english"],
-        "chinese": results["chinese"],
+        **results,
     }
 
 
@@ -291,33 +336,34 @@ def export_csv(jsonl_path: Path, csv_path: Path) -> None:
         for line in jsonl_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+    available_modes = [
+        mode
+        for mode in [*SUPPORTED_PIVOT_LANGUAGES, "Bypass"]
+        if any(mode.lower() in record for record in records)
+    ]
     fieldnames = [
         "case_id",
         "category",
         "repetition",
         "request_ko",
-        "english_input_pivot",
-        "english_qwen_pivot",
-        "english_qwen_reasoning",
-        "english_final_ko",
-        "chinese_input_pivot",
-        "chinese_qwen_pivot",
-        "chinese_qwen_reasoning",
-        "chinese_final_ko",
-        "english_total_seconds",
-        "chinese_total_seconds",
-        "english_tool_call_count",
-        "english_tool_codes",
-        "english_tool_results",
-        "chinese_tool_call_count",
-        "chinese_tool_codes",
-        "chinese_tool_results",
-        "english_final_chars",
-        "chinese_final_chars",
-        "final_length_delta",
-        "english_quality_score",
-        "chinese_quality_score",
-        "preferred_pivot",
+        "comparison_modes",
+        *[
+            f"{mode.lower()}_{field}"
+            for mode in available_modes
+            for field in (
+                "input_pivot",
+                "qwen_pivot",
+                "qwen_reasoning",
+                "final_ko",
+                "total_seconds",
+                "tool_call_count",
+                "tool_codes",
+                "tool_results",
+                "final_chars",
+                "quality_score",
+            )
+        ],
+        "preferred_mode",
         "evaluator_notes",
     ]
     csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -325,45 +371,42 @@ def export_csv(jsonl_path: Path, csv_path: Path) -> None:
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
         for record in records:
-            english = record["english"]
-            chinese = record["chinese"]
-            english_final = english["assistant_ko"]
-            chinese_final = chinese["assistant_ko"]
-            writer.writerow(
-                {
-                    "case_id": record["case_id"],
-                    "category": record["category"],
-                    "repetition": record["repetition"],
-                    "request_ko": record["request_ko"],
-                    "english_input_pivot": english["user_pivot"],
-                    "english_qwen_pivot": english["assistant_pivot"],
-                    "english_qwen_reasoning": english.get(
-                        "assistant_reasoning", ""
-                    ),
-                    "english_final_ko": english_final,
-                    "chinese_input_pivot": chinese["user_pivot"],
-                    "chinese_qwen_pivot": chinese["assistant_pivot"],
-                    "chinese_qwen_reasoning": chinese.get(
-                        "assistant_reasoning", ""
-                    ),
-                    "chinese_final_ko": chinese_final,
-                    "english_total_seconds": english["total_seconds"],
-                    "chinese_total_seconds": chinese["total_seconds"],
-                    "english_tool_call_count": english.get("tool_call_count", 0),
-                    "english_tool_codes": _tool_codes_for_csv(english),
-                    "english_tool_results": _tool_results_for_csv(english),
-                    "chinese_tool_call_count": chinese.get("tool_call_count", 0),
-                    "chinese_tool_codes": _tool_codes_for_csv(chinese),
-                    "chinese_tool_results": _tool_results_for_csv(chinese),
-                    "english_final_chars": len(english_final),
-                    "chinese_final_chars": len(chinese_final),
-                    "final_length_delta": len(chinese_final) - len(english_final),
-                    "english_quality_score": "",
-                    "chinese_quality_score": "",
-                    "preferred_pivot": "",
-                    "evaluator_notes": "",
-                }
-            )
+            row: dict[str, Any] = {
+                "case_id": record["case_id"],
+                "category": record["category"],
+                "repetition": record["repetition"],
+                "request_ko": record["request_ko"],
+                "comparison_modes": ",".join(
+                    record.get("comparison_modes", ["English", "Chinese"])
+                ),
+                "preferred_mode": "",
+                "evaluator_notes": "",
+            }
+            for mode in available_modes:
+                key = mode.lower()
+                result = record.get(key)
+                if result is None:
+                    continue
+                final_ko = result["assistant_ko"]
+                row.update(
+                    {
+                        f"{key}_input_pivot": result["user_pivot"],
+                        f"{key}_qwen_pivot": result["assistant_pivot"],
+                        f"{key}_qwen_reasoning": result.get(
+                            "assistant_reasoning", ""
+                        ),
+                        f"{key}_final_ko": final_ko,
+                        f"{key}_total_seconds": result["total_seconds"],
+                        f"{key}_tool_call_count": result.get(
+                            "tool_call_count", 0
+                        ),
+                        f"{key}_tool_codes": _tool_codes_for_csv(result),
+                        f"{key}_tool_results": _tool_results_for_csv(result),
+                        f"{key}_final_chars": len(final_ko),
+                        f"{key}_quality_score": "",
+                    }
+                )
+            writer.writerow(row)
 
 
 def _tool_codes_for_csv(result: dict[str, Any]) -> str:

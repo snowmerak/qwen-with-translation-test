@@ -1,7 +1,7 @@
 [project]
 name = "qwen-with-translation-test"
 version = "0.1.0"
-description = "Korean pivot-language Qwen chat with optional sandboxed Python"
+description = "Multilingual pivot and direct Korean Qwen chat experiment"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

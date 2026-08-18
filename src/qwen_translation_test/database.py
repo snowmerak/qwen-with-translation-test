@@ -32,6 +32,7 @@ class ChatDatabase:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL DEFAULT 'New conversation',
                 pivot_language TEXT NOT NULL DEFAULT 'English',
+                translation_bypass INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -68,10 +69,10 @@ class ChatDatabase:
                 ON tool_executions(conversation_id, id);
             """
         )
-        self._migrate_english_schema()
+        self._migrate_schema()
         self.connection.commit()
 
-    def _migrate_english_schema(self) -> None:
+    def _migrate_schema(self) -> None:
         conversation_columns = {
             row["name"]
             for row in self.connection.execute(
@@ -82,6 +83,11 @@ class ChatDatabase:
             self.connection.execute(
                 "ALTER TABLE conversations ADD COLUMN "
                 "pivot_language TEXT NOT NULL DEFAULT 'English'"
+            )
+        if "translation_bypass" not in conversation_columns:
+            self.connection.execute(
+                "ALTER TABLE conversations ADD COLUMN "
+                "translation_bypass INTEGER NOT NULL DEFAULT 0"
             )
 
         message_columns = {
@@ -99,10 +105,14 @@ class ChatDatabase:
         self,
         pivot_language: str = "English",
         title: str = "New conversation",
+        *,
+        translation_bypass: bool = False,
     ) -> int:
         cursor = self.connection.execute(
-            "INSERT INTO conversations(title, pivot_language) VALUES (?, ?)",
-            (title, pivot_language),
+            "INSERT INTO conversations("
+            "title, pivot_language, translation_bypass"
+            ") VALUES (?, ?, ?)",
+            (title, pivot_language, int(translation_bypass)),
         )
         self.connection.commit()
         return int(cursor.lastrowid)
@@ -121,6 +131,15 @@ class ChatDatabase:
         if row is None:
             raise ValueError(f"Conversation {conversation_id} does not exist")
         return str(row["pivot_language"])
+
+    def is_translation_bypassed(self, conversation_id: int) -> bool:
+        row = self.connection.execute(
+            "SELECT translation_bypass FROM conversations WHERE id = ?",
+            (conversation_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Conversation {conversation_id} does not exist")
+        return bool(row["translation_bypass"])
 
     def append_turn(
         self,
@@ -198,7 +217,8 @@ class ChatDatabase:
     def list_conversations(self) -> list[sqlite3.Row]:
         return self.connection.execute(
             """
-            SELECT c.id, c.title, c.pivot_language, c.created_at, c.updated_at,
+            SELECT c.id, c.title, c.pivot_language, c.translation_bypass,
+                   c.created_at, c.updated_at,
                    COUNT(m.id) AS message_count
             FROM conversations AS c
             LEFT JOIN messages AS m ON m.conversation_id = c.id
